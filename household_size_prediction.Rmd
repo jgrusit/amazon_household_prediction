@@ -1,0 +1,431 @@
+---
+title: "Household Size Prediction Models"
+date: "`r format(Sys.Date(), '%D')`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+### Regression Final Group Project: Household Size Prediction
+
+## Load Libraries
+
+```{r}
+library(tidyverse)
+library(mlr3verse)
+library(ggplot2)
+library(glmnet)
+library(randomForest)
+library(mgcv)
+future::plan("sequential")
+
+set.seed(67)
+```
+
+
+## Load the Data
+```{r}
+survey <- read_csv("survey_train_test.csv")
+amazon_purchases <- read_csv("amazon-purchases.csv")
+```
+
+
+## Adding Features
+```{r}
+# categorize amazon categories into 8 groups 
+categorize_product <- function(cat, title) {
+  cat   <- ifelse(is.na(cat), "", cat)    
+  title <- ifelse(is.na(title), "", title)
+  
+  case_when(
+    str_detect(cat, "GROCERY|FOOD|SNACK")                          ~ "grocery",
+    str_detect(cat, "BABY|DIAPER|TODDLER|INFANT")                  ~ "baby",
+    str_detect(cat, "TOY|GAME")                                    ~ "kids",
+    str_detect(cat, "PET")                                         ~ "pet",
+    str_detect(cat, "BOOK")                                        ~ "book",
+    str_detect(cat, "ELECTRONIC|COMPUTER|TABLET|PHONE|HEADPHONES") ~ "electronics",
+    str_detect(cat, "CLOTH|APPAREL|SHOE")                          ~ "apparel",
+    TRUE                                                           ~ "other"
+  )
+}
+
+
+# create new columns for every purchase row in the Amazon dataset
+amazon_purchases <- amazon_purchases %>%
+  mutate(
+    OrderDate_parsed = ymd(`Order Date`),
+    prod_group = categorize_product(Category, Title),
+    line_spend = `Purchase Price Per Unit` * Quantity,
+    has_pack_keywords = str_detect(tolower(Title), "pack|set|mult|combo"),
+    is_consumable = `Purchase Price Per Unit` < 10 & Category %in% c("GROCERY", "HOUSEHOLD"),
+    
+    has_toiletries = str_detect(tolower(Title), "toilet|shampoo|soap|paper"),
+    has_cleaning   = str_detect(tolower(Title), "cleaner|detergent|bleach|trash|wipe"),
+    has_laundry    = str_detect(tolower(Title), "detergent|softener|stain")
+  )
+
+# customer level summary
+purchase_summary <- amazon_purchases %>%
+  group_by(`Survey ResponseID`) %>%
+  summarize(
+    total_purchases  = n(),                           
+    total_spending   = sum(line_spend, na.rm = TRUE), 
+    total_quantity   = sum(Quantity, na.rm = TRUE),   
+    
+    avg_price    = mean(`Purchase Price Per Unit`, na.rm = TRUE),
+    median_price = median(`Purchase Price Per Unit`, na.rm = TRUE),
+    max_price    = max(`Purchase Price Per Unit`, na.rm = TRUE),
+    min_price    = min(`Purchase Price Per Unit`, na.rm = TRUE),
+    price_std    = sd(`Purchase Price Per Unit`, na.rm = TRUE),
+    price_range  = max(`Purchase Price Per Unit`, na.rm = TRUE) - 
+                   min(`Purchase Price Per Unit`, na.rm = TRUE),
+    
+    avg_quantity = mean(Quantity, na.rm = TRUE),
+    max_quantity = max(Quantity, na.rm = TRUE),
+    min_quantity = min(Quantity, na.rm = TRUE),
+    
+    unique_categories = n_distinct(Category, na.rm = TRUE),
+    pct_top_category  = {
+      cat_table <- table(Category[!is.na(Category)])
+      if (length(cat_table) > 0) max(cat_table) / n() else NA_real_
+    },
+    
+    n_unique_asins   = n_distinct(`ASIN/ISBN (Product Code)`, na.rm = TRUE),
+    n_repeat_asins   = sum(duplicated(`ASIN/ISBN (Product Code)`) > 0, na.rm = TRUE),
+    repeat_asin_rate = ifelse(n_unique_asins > 0, n_repeat_asins / n_unique_asins, 0),
+ 
+    n_pack_orders = sum(has_pack_keywords, na.rm = TRUE),
+    n_bulk_orders = sum(Quantity >= 5, na.rm = TRUE),
+    n_multi_item_orders = sum(Quantity >= 2, na.rm = TRUE),
+
+    n_consumables           = sum(is_consumable, na.rm = TRUE),
+    n_toiletries            = sum(has_toiletries, na.rm = TRUE),
+    n_cleaning              = sum(has_cleaning, na.rm = TRUE),
+    n_laundry               = sum(has_laundry, na.rm = TRUE),
+    n_household_maintenance = n_cleaning + n_laundry,
+    
+    first_date = suppressWarnings(min(OrderDate_parsed, na.rm = TRUE)),
+    last_date  = suppressWarnings(max(OrderDate_parsed, na.rm = TRUE)),
+    
+    spend_grocery  = sum(line_spend[prod_group == "grocery"], na.rm = TRUE),
+    spend_baby     = sum(line_spend[prod_group == "baby"], na.rm = TRUE),
+    spend_kids     = sum(line_spend[prod_group == "kids"], na.rm = TRUE),
+    spend_pet      = sum(line_spend[prod_group == "pet"], na.rm = TRUE),
+    spend_book     = sum(line_spend[prod_group == "book"], na.rm = TRUE),
+    spend_elec     = sum(line_spend[prod_group == "electronics"], na.rm = TRUE),
+    spend_apparel  = sum(line_spend[prod_group == "apparel"], na.rm = TRUE),
+    spend_other    = sum(line_spend[prod_group == "other"], na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+mutate(
+
+    purchase_days_span = ifelse(
+      is.finite(first_date) & is.finite(last_date),
+      as.numeric(difftime(last_date, first_date, units = "days")),
+      0
+    ),
+    purchases_per_day       = total_purchases / pmax(purchase_days_span, 1),
+    spending_per_day        = total_spending / pmax(purchase_days_span, 1),
+    avg_days_between_orders = purchase_days_span / pmax(total_purchases - 1, 1),
+    
+    spending_per_purchase = total_spending / pmax(total_purchases, 1),
+
+    log_total_spending  = log1p(total_spending),
+    log_total_purchases = log1p(total_purchases),
+    log_avg_price       = log1p(avg_price),
+
+    purchase_diversity = unique_categories / pmax(total_purchases, 1),
+    
+    pct_spend_grocery = spend_grocery / pmax(total_spending, 1),
+    pct_spend_baby    = spend_baby / pmax(total_spending, 1),
+    pct_spend_kids    = spend_kids / pmax(total_spending, 1),
+    pct_spend_pet     = spend_pet / pmax(total_spending, 1),
+    pct_spend_elec    = spend_elec / pmax(total_spending, 1),
+    pct_spend_book    = spend_book / pmax(total_spending, 1),
+    pct_spend_apparel = spend_apparel / pmax(total_spending, 1),
+    pct_spend_other   = spend_other / pmax(total_spending, 1),
+    
+    pct_bulk_orders = n_bulk_orders / pmax(total_purchases, 1),
+    pct_multi_item  = n_multi_item_orders / pmax(total_purchases, 1),
+    pct_pack_orders = n_pack_orders / pmax(total_purchases, 1),
+    
+    family_spending = pct_spend_baby + pct_spend_kids + pct_spend_grocery,
+    
+    consumables_per_month = n_consumables / pmax(purchase_days_span / 30, 1)
+  ) %>%
+
+  select(-first_date, -last_date)
+
+purchase_summary <- purchase_summary %>%
+  mutate(across(where(is.numeric),
+                ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)))
+
+```
+
+```{r}
+# survey demographics 
+survey_clean <- survey %>%
+  mutate(
+    Q.demos.gender = factor(Q.demos.gender),
+    Q.demos.state  = factor(Q.demos.state)
+  )
+full_data <- survey_clean %>%
+  left_join(
+    purchase_summary,
+    by = c("Survey.ResponseID" = "Survey ResponseID")
+  )
+full_data <- full_data %>%
+  mutate(across(where(is.numeric),
+                ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)))
+full_data <- full_data %>%
+  mutate(
+    orders_x_diversity  = total_purchases * purchase_diversity,
+    logspend_x_pct_baby = log_total_spending * pct_spend_baby,
+    logpurch_x_pct_kids = log_total_purchases * pct_spend_kids,
+    spendday_x_pct_groc = spending_per_day * pct_spend_grocery,
+    gender_x_spend_bin = interaction(
+      Q.demos.gender,
+      cut_number(log_total_spending, 3),
+      drop = TRUE
+    ),
+    
+    state_x_kids_bin = interaction(
+      Q.demos.state,
+      cut_number(pct_spend_kids, 3),
+      drop = TRUE
+    )
+  )
+```
+
+
+## Split the Train / Test Data
+```{r}
+train_data <- full_data %>% filter(test == 0)
+test_data <- full_data %>% filter(test == 1)
+
+train_complete <- train_data %>%
+filter(!is.na(Q.amazon.use.hh.size.num))
+```
+
+
+## Trimmed/Final Model Building 
+
+```{r}
+# trimmed features
+feature_cols_final <- c(
+  "Q.demos.gender", "Q.demos.state",
+  "logpurch_x_pct_kids", "logspend_x_pct_baby",
+  "purchase_days_span", "spending_per_day",
+  "pct_spend_baby", "pct_spend_kids", "pct_spend_elec",
+  "pct_spend_grocery", "pct_spend_pet",
+  "family_spending", "pct_multi_item", "pct_top_category",
+  "purchase_diversity", "median_price",
+  "pct_pack_orders", "n_household_maintenance",
+  "repeat_asin_rate", "n_unique_asins",
+  "log_total_spending"
+)
+
+train_for_task_final <- train_complete %>%
+  select(Q.amazon.use.hh.size.num, all_of(feature_cols_final))
+
+tsk_household_final <- as_task_regr(
+  train_for_task_final,
+  target = "Q.amazon.use.hh.size.num",
+  id     = "household_size_final"
+)
+
+test_for_pred_final <- test_data %>%
+  select(Survey.ResponseID, all_of(feature_cols_final))
+
+set.seed(67)
+resampling <- rsmp("cv", folds = 5)
+
+# ridge model
+set.seed(67)
+lrn_ridge_final <- as_learner(
+  po("encode", method = "one-hot") %>>%
+  po("imputemean") %>>%
+    lrn(
+      "regr.cv_glmnet",
+      alpha       = 0,
+      lambda      = 10^seq(from = -4, to = 2, by = 0.05),
+      standardize = TRUE
+    )
+)
+
+set.seed(67)
+rr_ridge_final <- resample(
+  task       = tsk_household_final,
+  learner    = lrn_ridge_final,
+  resampling = resampling
+)
+
+ridge_rmse_final <- rr_ridge_final$aggregate(msr("regr.rmse"))
+print(paste("Ridge (final features) CV RMSE:", ridge_rmse_final))
+
+# lasso model
+set.seed(67)
+lrn_lasso_final <- as_learner(
+  po("encode", method = "one-hot") %>>%
+  po("imputemean") %>>%
+    lrn(
+      "regr.cv_glmnet",
+      alpha       = 1,
+      lambda      = 10^seq(from = -4, to = 2, by = 0.05),
+      standardize = TRUE
+    )
+)
+
+set.seed(67)
+rr_lasso_final <- resample(
+  task       = tsk_household_final,
+  learner    = lrn_lasso_final,
+  resampling = resampling
+)
+
+lasso_rmse_final <- rr_lasso_final$aggregate(msr("regr.rmse"))
+print(paste("LASSO (final features) CV RMSE:", lasso_rmse_final))
+
+# random forest model
+
+# tuner we used
+# lrn_rf_tune_final <- as_learner(
+#   po("missind") %>>%
+#   po("imputehist", affect_columns = selector_type("integer")) %>>%
+#   po("imputeoor", affect_columns = selector_type("factor")) %>>%
+#     lrn("regr.ranger", 
+#       num.threads = 1,
+#       num.trees       = to_tune(800, 1500),
+#       mtry.ratio      = to_tune(0.2, 0.8),   
+#       sample.fraction = to_tune(0.6, 1.0),  
+#       min.node.size   = to_tune(1, 10),
+#       importance = "impurity"
+#     )
+# )
+
+set.seed(67)
+lrn_rf_tune_final <- as_learner(
+  po("missind") %>>%
+  po("imputehist", affect_columns = selector_type("integer")) %>>%
+  po("imputeoor", affect_columns = selector_type("factor")) %>>%
+    lrn("regr.ranger", 
+      num.threads = 1,
+      num.trees       = 1381,
+      mtry.ratio      = 0.2745159,   
+      sample.fraction = 0.6580872,  
+      min.node.size   = 10,
+      importance = "impurity"
+    )
+)
+
+set.seed(67)
+rr_rf_final <- resample(
+  task       = tsk_household_final,
+  learner    = lrn_rf_tune_final,
+  resampling = resampling
+)
+
+rf_rmse_final <- rr_rf_final$aggregate(msr("regr.rmse"))
+print(paste("RF (final features) CV RMSE:", rf_rmse_final))
+
+# xgboost model
+
+# tuner we used
+# set.seed(67)
+# lrn_xgb_tune_final <- as_learner(
+#   po("encode", method = "one-hot") %>>%
+#   po("imputemean") %>>%
+#     lrn(
+#       "regr.xgboost",
+#       nrounds          = to_tune,     
+#       max_depth        = to_tune(3, 9),          
+#       eta              = to_tune(0.008, 0.1),    
+#       subsample        = to_tune(0.65, 0.95),
+#       colsample_bytree = to_tune(0.65, 0.95),
+#       min_child_weight = to_tune(2, 15),          
+#       gamma            = to_tune(0, 0.8)   
+#     )
+# )
+
+
+set.seed(67)
+lrn_xgb_tune_final <- as_learner(
+  po("encode", method = "one-hot") %>>%
+  po("imputemean") %>>%
+    lrn(
+      "regr.xgboost",
+      nrounds          = 167,    
+      max_depth        = 3,          
+      eta              = 0.02251698,    
+      subsample        = 0.7214576,
+      colsample_bytree = 0.7563982,
+      min_child_weight = 5.609415,          
+      gamma            = 9.7132525,
+      nthread = 1
+      )
+)
+
+set.seed(67)
+rr_xgb_final <- resample(
+  task       = tsk_household_final,
+  learner    = lrn_xgb_tune_final,
+  resampling = resampling
+)
+
+xgb_rmse_final <- rr_xgb_final$aggregate(msr("regr.rmse"))
+print(paste("XGBoost (final features) CV RMSE:", xgb_rmse_final))
+
+# train on all models 
+lrn_ridge_final$train(tsk_household_final)
+lrn_lasso_final$train(tsk_household_final)
+lrn_rf_tune_final$train(tsk_household_final)
+lrn_xgb_tune_final$train(tsk_household_final)
+
+# predict for all models 
+ridge_preds_final <- lrn_ridge_final$predict_newdata(test_for_pred_final)
+lasso_preds_final <- lrn_lasso_final$predict_newdata(test_for_pred_final)
+rf_preds_final    <- lrn_rf_tune_final$predict_newdata(test_for_pred_final)
+xgb_preds_final   <- lrn_xgb_tune_final$predict_newdata(test_for_pred_final)
+
+
+ridge_submission_final <- tibble(
+  Survey.ResponseID        = test_for_pred_final$Survey.ResponseID,
+  Q.amazon.use.hh.size.num = ridge_preds_final$response
+)
+write_csv(ridge_submission_final, "prediction_ridge_final_1.csv")
+
+lasso_submission_final <- tibble(
+  Survey.ResponseID        = test_for_pred_final$Survey.ResponseID,
+  Q.amazon.use.hh.size.num = lasso_preds_final$response
+)
+write_csv(lasso_submission_final, "prediction_lasso_final_1.csv")
+
+rf_submission_final <- tibble(
+  Survey.ResponseID        = test_for_pred_final$Survey.ResponseID,
+  Q.amazon.use.hh.size.num = rf_preds_final$response
+)
+write_csv(rf_submission_final, "prediction_rf_final_1.csv")
+
+xgb_submission_final <- tibble(
+  Survey.ResponseID        = test_for_pred_final$Survey.ResponseID,
+  Q.amazon.use.hh.size.num = xgb_preds_final$response
+)
+write_csv(xgb_submission_final, "prediction_xgb_final_1.csv")
+
+
+```
+
+```{r}
+# RMSE comparison
+results <- data.frame(
+  Model = c("Ridge", "LASSO", "Random Forest", "XGBoost"),
+  RMSE = c((ridge_rmse_final), (lasso_rmse_final), (rf_rmse_final),(xgb_rmse_final))
+)
+
+print(results)
+```
+
